@@ -134,13 +134,14 @@ LOGO_JS = "([hint, mobile]) => {" + VIS_JS + r"""
     file: (c.isImg ? c.src.split('/').pop() : (c.el.getAttribute('aria-label') || cls(c.el) || cls(c.el.parentElement) ||
            (c.a && (c.a.getAttribute('aria-label') || cls(c.a))) || 'logo')).slice(0, 70),
     isHeaderLogoFile: true, loaded: c.loaded, visible: vis(c.el), x: Math.round(c.x), y: Math.round(c.y), w: Math.round(c.r.width),
+    stuckAnimation: !!c.el.closest('.elementor-invisible, .et_animated:not(.et-animated)'),
     inPlace: c.y < 250 && (mobile || c.x < vw * 0.4) });
   const kept = info.filter(c => c.keep).map(c => Object.assign(describe(c), { score: c.score }));
   const good = kept.filter(c => c.loaded && c.visible && c.inPlace && c.w >= 40).sort((p, q) => q.score - p.score || p.y - q.y);
   const rest = kept.filter(c => !good.includes(c)).sort((p, q) => (q.visible - p.visible) || (p.y - q.y));
   // For troubleshooting: every visible graphic near the top of the page, whether or not it counted
-  const topGraphics = good.length ? [] : info.filter(c => c.y < 300 && vis(c.el) && c.r.width >= 20).slice(0, 8)
-    .map(c => `${c.isImg ? 'image ' + c.src.split('/').pop() : 'drawn'} | ${cls(c.el).slice(0, 40)} | box: ${cls(c.el.parentElement).slice(0, 50)} | link: ${c.a ? (c.a.getAttribute('href') || '').slice(0, 60) : 'none'} | ${Math.round(c.r.width)}px at x=${Math.round(c.x)}, y=${Math.round(c.y)}${c.keep ? '' : ' (skipped)'}`);
+  const topGraphics = good.length ? [] : info.filter(c => c.y < 300 && (c.r.width >= 20 || !vis(c.el))).slice(0, 10)
+    .map(c => `${c.isImg ? 'image ' + c.src.split('/').pop() : 'drawn'} | ${cls(c.el).slice(0, 40)} | box: ${cls(c.el.parentElement).slice(0, 50)} | link: ${c.a ? (c.a.getAttribute('href') || '').slice(0, 60) : 'none'} | ${Math.round(c.r.width)}px at x=${Math.round(c.x)}, y=${Math.round(c.y)}${vis(c.el) ? '' : ' (hidden)'}${c.keep ? '' : ' (skipped)'}`);
   return { ok: good.length > 0, candidates: [...good, ...rest].slice(0, 8), topGraphics };
 }"""
 
@@ -257,6 +258,25 @@ def _scroll_through(page) -> None:
     page.wait_for_timeout(1200)
 
 
+def _act_like_a_visitor(page) -> None:
+    """Many WordPress speed plugins hold back parts of the page (often the header) until the visitor moves the
+    mouse, scrolls the wheel, or touches the screen. Real visitors always do, so the monitor does too."""
+    try:
+        page.mouse.move(200, 300)
+        page.mouse.move(420, 360, steps=5)
+        page.mouse.wheel(0, 300)
+        page.evaluate("""() => {
+          for (const ev of ['mousemove', 'mousedown', 'keydown', 'touchstart', 'touchmove', 'wheel', 'scroll'])
+            window.dispatchEvent(new Event(ev, {bubbles: true}));
+          document.dispatchEvent(new Event('mousemove', {bubbles: true}));
+        }""")
+        page.wait_for_timeout(2500)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(800)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def check_page(pw, browser, target: str, view: str) -> dict:
     from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -287,9 +307,15 @@ def check_page(pw, browser, target: str, view: str) -> dict:
             pass  # chat widgets and trackers often keep the network busy; not a failure
         res["load_ms"] = int((time.monotonic() - t0) * 1000)
         res["loaded"] = True
+        _act_like_a_visitor(page)
 
         if target == "home":
-            logo = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
+            deadline = time.monotonic() + 10
+            while True:
+                logo = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
+                if logo["ok"] or time.monotonic() > deadline:
+                    break
+                page.wait_for_timeout(1000)
             res["checks"]["logo"] = {"ok": logo["ok"], "candidates": logo["candidates"], "topGraphics": logo["topGraphics"]}
             _scroll_through(page)
             try:  # bring the heading into view in case it has an entrance animation
@@ -440,16 +466,19 @@ def _diag_view(d: Diagnosis, target: str, view: str, br: dict) -> None:
 
     logo = c.get("logo")
     if logo and not logo.get("ok"):
-        cands = logo.get("candidates", [])
+        cands = [x for x in logo.get("candidates", []) if x.get("y", 0) < 300]  # pictures far down the page aren't the header logo
         files = [x for x in cands if x.get("isHeaderLogoFile")]
         broken = [x for x in files if not x.get("loaded")]
         if not cands:
-            d.reason(label, "Logo: no CreditAssociates logo was found on the page.", view)
+            d.reason(label, "Logo: no CreditAssociates logo was found at the top of the page.", view)
             d.step("The header may not be rendering. Check recent edits to the site header template (Theme Builder/Elementor).")
         elif broken:
             d.reason(label, f"Logo: the image file failed to download ({broken[0]['url']}).", view)
             d.step("Open the logo URL directly. If it shows 'Not Found', the file was deleted or renamed in the WordPress "
                    "Media Library. Re-upload it or re-select it in the header settings, then purge cache.")
+        elif files and not any(x.get("visible") for x in files) and any(x.get("stuckAnimation") for x in files):
+            d.reason(label, "Logo: it's on the page but stuck invisible. The header's fade-in never ran, which happens when site JavaScript breaks.", view)
+            d.step("Check the JavaScript errors below. Clear the cache/speed plugin (e.g. WP Rocket, LiteSpeed, Autoptimize); these commonly break scripts.")
         elif files and not any(x.get("visible") for x in files):
             d.reason(label, "Logo: the logo is on the page but hidden.", view)
             d.step("A stylesheet may have failed or the header was edited. Purge cache and review recent header changes.")
