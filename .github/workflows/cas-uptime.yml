@@ -1,0 +1,74 @@
+name: CAS website uptime monitor
+
+on:
+  schedule:
+    - cron: "8,23,38,53 * * * *"   # every 15 minutes (UTC), offset from the ADR robot
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a TEST message to Teams instead of checking the site"
+        type: choice
+        options: [none, down, recovery]
+        default: none
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cas-uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check creditassociates.com (desktop + mobile)
+        env:
+          # Uses CAS_TEAMS_WEBHOOK_URL if you add one (to send CAS alerts to a different chat); otherwise the shared one.
+          TEAMS_WEBHOOK_URL: ${{ secrets.CAS_TEAMS_WEBHOOK_URL || secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          if [ "${{ inputs.test_alert }}" = "down" ] || [ "${{ inputs.test_alert }}" = "recovery" ]; then
+            python monitor_cas.py --test-alert "${{ inputs.test_alert }}"
+          else
+            python monitor_cas.py
+          fi
+
+      - name: Save up/down status (and keep the schedule alive)
+        if: always()
+        run: |
+          git config user.name  "cas-uptime-monitor"
+          git config user.email "cas-uptime-monitor@users.noreply.github.com"
+          # GitHub pauses schedules in repos with no activity for 60 days, so record a heartbeat every ~45 days.
+          last=$(git log -1 --format=%ct); now=$(date +%s)
+          if [ $(( (now - last) / 86400 )) -ge 45 ]; then
+            mkdir -p state && date -u +"%Y-%m-%dT%H:%M:%SZ" > state/cas-heartbeat.txt
+          fi
+          git add state/ 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No status change to save."
+          else
+            git commit -m "CAS monitor status update [skip ci]"
+            for i in 1 2 3; do git pull --rebase --quiet && git push --quiet && break; sleep 5; done
+          fi
+
+      - name: Save screenshots of what the monitor saw (failures only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cas-screenshots
+          path: screenshots-cas/
+          if-no-files-found: ignore
+          retention-days: 14
