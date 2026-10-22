@@ -100,37 +100,48 @@ LOGO_JS = "([hint, mobile]) => {" + VIS_JS + r"""
   const cls = el => !el ? '' : typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
   const attrs = el => el ? [el.getAttribute('src'), el.currentSrc, el.getAttribute('alt'), el.getAttribute('aria-label'),
                             el.getAttribute('title'), el.id, cls(el)].join(' ') : '';
+  const ancestors = (el, n) => { const out = []; let p = el.parentElement;
+    while (p && out.length < n && p !== document.body) { out.push(p); p = p.parentElement; } return out; };
+  const ctx = el => ancestors(el, 4).map(a => cls(a) + ' ' + (a.id || '') + ' ' + (a.getAttribute('aria-label') || '')).join(' ');
   // Logos almost always link to the homepage. Other links aren't evidence: every link contains the site's address.
   const isHomeLink = a => { if (!a) return false;
     try { const u = new URL(a.getAttribute('href') || '', location.href); return (u.pathname === '/' || u.pathname === '') && !u.hash; }
     catch (e) { return false; } };
-  // Small interface icons (menu arrows/carets, hamburger, search, close) are never the logo
-  const iconLike = el => /(^|[\s_-])(icon|caret|arrow|chevron|fa[srb]?|e-font-icon|hamburger|toggle|close|search)([\s_-]|$)/i
-                           .test(cls(el) + ' ' + cls(el.parentElement));
+  // Small interface icons (menu arrows/carets, hamburger, search, close): judged by the graphic's OWN name only,
+  // because website builders often put a real logo inside a box named "icon".
+  const iconLike = el => /(^|[\s_-])(caret|arrow|chevron|fa[srb]?|e-font-icon-svg|hamburger|toggle|close|search)([\s_-]|$)/i.test(cls(el));
+  // Award banners, badges and review stars are never the logo
+  const bannerWords = /banner|award|badge|top[\s_-]?work|t100|trustpilot|rating|bbb|stars?\b|review/i;
   const inMenuItem = el => !!el.closest('li, [role=menuitem], .menu-item, .e-n-menu-item, .sub-menu, .dropdown');
-  const all = [...document.querySelectorAll('img, svg')]
+  const maxShare = mobile ? 0.65 : 0.45;
+
+  const info = [...document.querySelectorAll('img, svg')]
     .filter(el => el.tagName.toLowerCase() !== 'svg' || !el.parentElement.closest('svg'))
     .filter(el => !iconLike(el))
     .map(el => {
-      const a = el.closest('a');
-      const ownMatch = re.test(attrs(el)), ctxMatch = re.test(attrs(el.parentElement) + ' ' + attrs(a)), home = isHomeLink(a);
-      return { el, ownMatch, ok: ownMatch || ((ctxMatch || home) && !inMenuItem(el)) };
-    })
-    .filter(c => c.ok).map(c => c.el);
-  const info = all.map(el => {
-    const r = el.getBoundingClientRect(), x = r.left + scrollX, y = r.top + scrollY;
-    const isImg = el.tagName.toLowerCase() === 'img';
-    const src = isImg ? (el.currentSrc || el.src || '') : '';
-    const loaded = !isImg || (el.complete && (el.naturalWidth > 0 || (/\.svg(\?|$)/i.test(src) && r.width > 0)));
-    const a = el.closest('a');
-    return { kind: isImg ? 'image' : 'drawn (svg)', url: src,
-             file: (isImg ? src.split('/').pop() : (el.getAttribute('aria-label') || cls(el) || (a && (a.getAttribute('aria-label') || cls(a))) || 'logo')).slice(0, 70),
-             isHeaderLogoFile: true, loaded, visible: vis(el), x: Math.round(x), y: Math.round(y), w: Math.round(r.width),
-             inPlace: y < 250 && (mobile || x < vw * 0.4) };
-  });
-  const good = info.filter(c => c.loaded && c.visible && c.inPlace && c.w >= 40);
-  const rest = info.filter(c => !good.includes(c)).sort((p, q) => (q.visible - p.visible) || (p.y - q.y));
-  return { ok: good.length > 0, candidates: [...good, ...rest].slice(0, 8) };
+      const a = el.closest('a'), r = el.getBoundingClientRect(), x = r.left + scrollX, y = r.top + scrollY;
+      const own = attrs(el), around = attrs(el.parentElement) + ' ' + attrs(a) + ' ' + ctx(el);
+      const ownMatch = re.test(own), ctxMatch = re.test(around), home = isHomeLink(a);
+      const isBanner = bannerWords.test(own + ' ' + attrs(a)) || r.width > vw * maxShare;
+      const isImg = el.tagName.toLowerCase() === 'img';
+      const src = isImg ? (el.currentSrc || el.src || '') : '';
+      const loaded = !isImg || (el.complete && (el.naturalWidth > 0 || (/\.svg(\?|$)/i.test(src) && r.width > 0)));
+      const score = (/logo/i.test(own + ' ' + around) ? 4 : 0) + (home ? 2 : 0) + (ownMatch ? 2 : 0) + (ctxMatch ? 1 : 0);
+      return { el, keep: !isBanner && (ownMatch || ((ctxMatch || home) && !inMenuItem(el))), score, isImg, src, loaded, x, y, r, a };
+    });
+  const describe = c => ({
+    kind: c.isImg ? 'image' : 'drawn (svg)', url: c.src,
+    file: (c.isImg ? c.src.split('/').pop() : (c.el.getAttribute('aria-label') || cls(c.el) || cls(c.el.parentElement) ||
+           (c.a && (c.a.getAttribute('aria-label') || cls(c.a))) || 'logo')).slice(0, 70),
+    isHeaderLogoFile: true, loaded: c.loaded, visible: vis(c.el), x: Math.round(c.x), y: Math.round(c.y), w: Math.round(c.r.width),
+    inPlace: c.y < 250 && (mobile || c.x < vw * 0.4) });
+  const kept = info.filter(c => c.keep).map(c => Object.assign(describe(c), { score: c.score }));
+  const good = kept.filter(c => c.loaded && c.visible && c.inPlace && c.w >= 40).sort((p, q) => q.score - p.score || p.y - q.y);
+  const rest = kept.filter(c => !good.includes(c)).sort((p, q) => (q.visible - p.visible) || (p.y - q.y));
+  // For troubleshooting: every visible graphic near the top of the page, whether or not it counted
+  const topGraphics = good.length ? [] : info.filter(c => c.y < 300 && vis(c.el) && c.r.width >= 20).slice(0, 8)
+    .map(c => `${c.isImg ? 'image ' + c.src.split('/').pop() : 'drawn'} | ${cls(c.el).slice(0, 40)} | box: ${cls(c.el.parentElement).slice(0, 50)} | link: ${c.a ? (c.a.getAttribute('href') || '').slice(0, 60) : 'none'} | ${Math.round(c.r.width)}px at x=${Math.round(c.x)}, y=${Math.round(c.y)}${c.keep ? '' : ' (skipped)'}`);
+  return { ok: good.length > 0, candidates: [...good, ...rest].slice(0, 8), topGraphics };
 }"""
 
 CHROME_SELECTOR = ("header, nav, [role=navigation], [role=banner], [data-elementor-type=header], "
@@ -279,7 +290,7 @@ def check_page(pw, browser, target: str, view: str) -> dict:
 
         if target == "home":
             logo = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
-            res["checks"]["logo"] = {"ok": logo["ok"], "candidates": logo["candidates"]}
+            res["checks"]["logo"] = {"ok": logo["ok"], "candidates": logo["candidates"], "topGraphics": logo["topGraphics"]}
             _scroll_through(page)
             try:  # bring the heading into view in case it has an entrance animation
                 page.get_by_text(re.compile(HEADING_HINT, re.I)).last.scroll_into_view_if_needed(timeout=3000)
@@ -440,7 +451,7 @@ def _diag_view(d: Diagnosis, target: str, view: str, br: dict) -> None:
             d.step("Open the logo URL directly. If it shows 'Not Found', the file was deleted or renamed in the WordPress "
                    "Media Library. Re-upload it or re-select it in the header settings, then purge cache.")
         elif files and not any(x.get("visible") for x in files):
-            d.reason(label, "Logo: the image downloads but is hidden on the page.", view)
+            d.reason(label, "Logo: the logo is on the page but hidden.", view)
             d.step("A stylesheet may have failed or the header was edited. Purge cache and review recent header changes.")
         else:
             d.reason(label, "Logo: a logo is present but not where it belongs in the header.", view)
@@ -737,6 +748,7 @@ def main() -> int:
                       "what_it_found": {v: {
                           "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}, {c.get('w')}px wide{'' if c.get('visible') else ' (hidden)'}"
                                    for c in results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("candidates", [])[:3]],
+                          "top_of_page_graphics": results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("topGraphics", []),
                           "headline": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("heading", {}).get("matches", [])[:2]],
                           "footer": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("footer", {}).get("matches", [])[:2]],
                       } for v in VIEWS}},
