@@ -3,8 +3,8 @@
 CreditAssociates - website uptime monitor (runs every 15 minutes)
 ==================================================================
 The site counts as "UP" only when ALL of these pass on the homepage, on BOTH desktop and mobile:
-  1. The CreditAssociates logo loads and is visible at the top of the page
-     (top-left on desktop; top of the screen on mobile)
+  1. The lead form works: the "Start here to save up to HALF!" heading is visible and the form's
+     fill-in boxes appear (the monitor never fills in or submits the form)
   2. The "How it Works" headline is visible in the page content (a "How it Works" menu link doesn't count)
   3. "CreditAssociates" appears in the footer (as text, or as the logo image in the footer)
 
@@ -58,11 +58,19 @@ BRAND = r"credit[\s\-_]*associates"
 # Logo: an image or drawn logo near the top whose file name / description / link mentions the brand or "logo"
 LOGO_HINT = r"credit[\s\-_]*associates|logo"
 # The headline must read just "How it Works" (a sentence that merely contains those words doesn't count)
+# Lead form: its heading plus at least 2 visible fill-in boxes
+FORM_HEADING_PATTERN = r"start\s+here\s+to\s+save\s+up\s+to\s+half"
+FORM_HEADING_HINT = r"save\s+up\s+to"
+MIN_FORM_FIELDS = 2
 HEADING_PATTERN = r"^\s*how\s+it\s+works\s*[.!?:]?\s*$"
 HEADING_HINT = r"how\s+it\s+works"
 HEADING_LABEL = "How it Works"
-CHECK_LABELS = {"logo": "Logo", "heading": "How it Works", "footer": "Footer"}
-TARGET_CHECKS = {"home": ("logo", "heading", "footer")}
+CHECK_LABELS = {"form": "Lead form", "heading": "How it Works", "footer": "Footer"}
+TARGET_CHECKS = {"home": ("form", "heading", "footer")}
+IGNORE_FRAME_HOSTS = ("recaptcha", "hcaptcha", "challenges.cloudflare", "google.com", "doubleclick", "facebook",
+                      "livechat", "intercom", "drift", "zendesk", "zopim", "tawk", "hubspot", "youtube",
+                      "vimeo", "trustpilot", "bbb.org", "clarity.ms", "hotjar")
+
 
 ERROR_SIGNATURES = {
     "error establishing a database connection":
@@ -187,6 +195,28 @@ FOOTER_JS = "([pattern, footerSel]) => {" + VIS_JS + r"""
   const all = [...texts, ...imgs], mine = all.filter(i => i.inFooter);
   return { inDom: mine.length > 0, ok: mine.some(i => i.visible), matches: mine.slice(0, 6),
            saw: all.filter(i => !i.inFooter).slice(0, 3), footerExists: !!document.querySelector(footerSel) };
+}"""
+
+FORM_JS = "() => {" + VIS_JS + r"""
+  const notChrome = el => !el.closest('header, nav, footer, [role=search], .et_search_outer, .et-search-form, #top-header, #main-header');
+  const fields = [...document.querySelectorAll('input, select, textarea, [role=radio], [role=slider], [role=combobox], [role=textbox]')]
+    .filter(el => !['hidden', 'submit', 'button', 'image', 'reset', 'search'].includes((el.type || '').toLowerCase()))
+    .filter(el => notChrome(el) && vis(el));
+  // Styled answer cards: the real radio/checkbox is hidden and people click its label
+  const cards = [...document.querySelectorAll('label')].filter(l => {
+    const inp = l.control || l.querySelector('input');
+    return inp && ['radio', 'checkbox'].includes((inp.type || '').toLowerCase()) && notChrome(l) && vis(l);
+  });
+  const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role=button]')]
+    .filter(b => notChrome(b) && vis(b))
+    .map(b => (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40))
+    .filter(Boolean);
+  return {
+    interactive: fields.length + cards.length,
+    fields: [...fields.map(f => f.getAttribute('aria-label') || f.name || f.placeholder || f.id || f.type || f.tagName.toLowerCase()),
+             ...cards.map(c => 'choice: ' + c.innerText.trim().slice(0, 30))].slice(0, 8),
+    buttons: buttons.slice(0, 6),
+  };
 }"""
 
 # ------------------------------------------------------------------ network checks
@@ -314,13 +344,27 @@ def check_page(pw, browser, target: str, view: str) -> dict:
         _act_like_a_visitor(page)
 
         if target == "home":
-            deadline = time.monotonic() + 10
+            # 1) Lead form: heading visible + fill-in boxes appear (forms built by JavaScript can take a few seconds)
+            deadline = time.monotonic() + 20
             while True:
-                logo = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
-                if logo["ok"] or time.monotonic() > deadline:
+                fheading = page.evaluate(TEXT_JS, [FORM_HEADING_PATTERN, FORM_HEADING_HINT, CHROME_SELECTOR])
+                frames = []
+                for fr in page.frames:
+                    host = urlparse(fr.url).hostname or ""
+                    if fr != page.main_frame and any(h in host for h in IGNORE_FRAME_HOSTS):
+                        continue
+                    try:
+                        info = fr.evaluate(FORM_JS)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    info["where"] = "main page" if fr == page.main_frame else f"embedded form from {host}"
+                    frames.append(info)
+                total = sum(f["interactive"] for f in frames)
+                if (fheading.get("ok") and total >= MIN_FORM_FIELDS) or time.monotonic() > deadline:
                     break
                 page.wait_for_timeout(1000)
-            res["checks"]["logo"] = {"ok": logo["ok"], "candidates": logo["candidates"], "topGraphics": logo["topGraphics"]}
+            res["checks"]["form"] = {"ok": bool(fheading.get("ok")) and total >= MIN_FORM_FIELDS, "interactive": total,
+                                     "heading": fheading, "found": [f for f in frames if f["interactive"]][:3]}
             _scroll_through(page)
             try:  # bring the heading into view in case it has an entrance animation
                 page.get_by_text(re.compile(HEADING_HINT, re.I)).last.scroll_into_view_if_needed(timeout=3000)
@@ -502,6 +546,23 @@ def _diag_view(d: Diagnosis, target: str, view: str, br: dict) -> None:
         seen = [x for x in chk.get("saw", []) if x.get("text")]
         return f' (The name does appear higher up the page: "{seen[0]["text"]}".)' if seen else ""
 
+    fm = c.get("form")
+    if fm and not fm.get("ok"):
+        fh = fm.get("heading", {})
+        if not fh.get("ok"):
+            if not fh.get("inDom"):
+                d.reason(label, 'Lead form: the "Start here to save up to HALF!" heading isn\'t on the page.' + _saw(fh), view)
+                d.step("Check recent edits to the homepage's form section. (If its heading was reworded on purpose, "
+                       "update FORM_HEADING_PATTERN in monitor_cas.py.)")
+            else:
+                d.reason(label, 'Lead form: the "Start here to save up to HALF!" heading is on the page but hidden.', view)
+                d.step("Check the form section's mobile/desktop visibility settings and whether CSS files loaded.")
+        if fm.get("interactive", 0) < MIN_FORM_FIELDS:
+            d.reason(label, f"Lead form: only {fm.get('interactive', 0)} fill-in box(es) appeared within 20 seconds "
+                            f"(expected at least {MIN_FORM_FIELDS}). Visitors may not be able to submit their information.", view)
+            d.step("Open the homepage and try the form. If its boxes are missing, check that the form plugin is active and "
+                   "look at the JavaScript errors below.")
+
     h = c.get("heading")
     if h and not h.get("ok"):
         if not h.get("inDom"):
@@ -577,6 +638,8 @@ def diagnose(base: dict, results: dict) -> Diagnosis:
     any_unloaded = any(not results[t].get(v, {}).get("loaded") for t in TARGETS for v in VIEWS)
     if failing == all_views and (any_unloaded or len(broken_items) == len(order)):
         d.head("The server responds, but the homepage isn't displaying correctly on any device. Visitors likely see a broken page.")
+    elif failing == all_views and broken_items == ["form"]:
+        d.head("The site is up, but the lead form isn't working, so new leads may not be coming in.")
     elif failing == all_views:
         names = " and ".join(f'"{CHECK_LABELS[k]}"' for k in broken_items)
         d.head(f"The site is up, but part of the homepage is broken: {names} "
@@ -702,7 +765,7 @@ def build_recovery_card(down_since: dt.datetime, prior_headline: str, test=False
             {"title": "Down for", "value": f"about {dur}"},
             {"title": "Went down", "value": down_since.strftime("%b %d, %I:%M %p CT")},
             {"title": "What was wrong", "value": prior_headline or "n/a"},
-            {"title": "Now passing", "value": "Logo, How it Works headline, and footer, on desktop and mobile"},
+            {"title": "Now passing", "value": "Lead form, How it Works headline, and footer, on desktop and mobile"},
         ]},
         _tb("Tip: note what fixed it in this chat so the team knows next time.", isSubtle=True, size="Small"),
     ]
@@ -747,14 +810,13 @@ def _parse(ts: str | None) -> dt.datetime | None:
 
 # ------------------------------------------------------------------ main
 def _sample_results():
-    bad_logo = {"loaded": True, "load_ms": 4100, "console_errors": [], "notes": [],
-                "failed_requests": ["HTTP 404: https://www.creditassociates.com/wp-content/uploads/creditassociates-logo.svg"],
-                "checks": {"logo": {"ok": False, "candidates": [{"isHeaderLogoFile": True, "loaded": False, "visible": False,
-                                    "url": "https://www.creditassociates.com/wp-content/uploads/creditassociates-logo.svg"}]},
+    bad_form = {"loaded": True, "load_ms": 4100, "console_errors": ["Uncaught ReferenceError: gform is not defined"], "notes": [],
+                "failed_requests": ["HTTP 500: https://www.creditassociates.com/wp-content/plugins/gravityforms/js/gravityforms.min.js"],
+                "checks": {"form": {"ok": False, "interactive": 0, "heading": {"ok": True, "inDom": True}},
                            "heading": {"ok": True, "inDom": True}, "footer": {"ok": True, "inDom": True}}}
     base = {"dns": {"ok": True, "ips": ["203.0.113.20"]}, "tls": {"ok": True, "expires": "2027-02-01", "days_left": 103}}
     http = {"ok": True, "status": 200, "ttfb_ms": 580, "server": "cloudflare", "cache": "HIT", "signatures": []}
-    return base, {"home": {"http": http, "desktop": bad_logo, "mobile": bad_logo}}
+    return base, {"home": {"http": http, "desktop": bad_form, "mobile": bad_form}}
 
 
 def main() -> int:
@@ -762,7 +824,7 @@ def main() -> int:
         kind = sys.argv[sys.argv.index("--test-alert") + 1] if len(sys.argv) > sys.argv.index("--test-alert") + 1 else "down"
         since = dt.datetime.now(CT) - dt.timedelta(minutes=47)
         if kind == "recovery":
-            card = build_recovery_card(since, "The server responds, but the homepage logo didn't load.", test=True)
+            card = build_recovery_card(since, "The site is up, but the lead form isn't working.", test=True)
         else:
             base, results = _sample_results()
             card = build_down_card(base, results, diagnose(base, results), dt.datetime.now(CT), test=True)
@@ -779,10 +841,10 @@ def main() -> int:
     print(json.dumps({"time": now.isoformat(), "up": up, "previous_status": state.get("status"),
                       "views": {f"{t}/{v}": _view_summary(t, results[t].get(v, {})) for t in TARGETS for v in VIEWS},
                       "what_it_found": {v: {
-                          "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}, {c.get('w')}px wide"
-                                   f"{'' if c.get('visible') else (' (waiting for its fade-in; counts as OK)' if c.get('waitingToFadeIn') else ' (hidden)')}"
-                                   for c in results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("candidates", [])[:3]],
-                          "top_of_page_graphics": results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("topGraphics", []),
+                          "lead_form": {
+                              "heading": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("form", {}).get("heading", {}).get("matches", [])[:1]],
+                              "fill_in_boxes": results["home"].get(v, {}).get("checks", {}).get("form", {}).get("interactive"),
+                              "found": results["home"].get(v, {}).get("checks", {}).get("form", {}).get("found", [])[:1]},
                           "headline": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("heading", {}).get("matches", [])[:2]],
                           "footer": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("footer", {}).get("matches", [])[:2]],
                           "page_problems": (results["home"].get(v, {}).get("console_errors", [])[:3]
