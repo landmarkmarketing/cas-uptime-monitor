@@ -135,12 +135,16 @@ LOGO_JS = "([hint, mobile]) => {" + VIS_JS + r"""
            (c.a && (c.a.getAttribute('aria-label') || cls(c.a))) || 'logo')).slice(0, 70),
     isHeaderLogoFile: true, loaded: c.loaded, visible: vis(c.el), x: Math.round(c.x), y: Math.round(c.y), w: Math.round(c.r.width),
     stuckAnimation: !!c.el.closest('.elementor-invisible, .et_animated:not(.et-animated)'),
+    waitingToFadeIn: !vis(c.el) && c.r.width > 0 && c.r.height > 0 && !!c.el.closest('.elementor-invisible, .et_animated:not(.et-animated)')
+                     && getComputedStyle(c.el).display !== 'none',
     inPlace: c.y < 250 && (mobile || c.x < vw * 0.4) });
   const kept = info.filter(c => c.keep).map(c => Object.assign(describe(c), { score: c.score }));
-  const good = kept.filter(c => c.loaded && c.visible && c.inPlace && c.w >= 40).sort((p, q) => q.score - p.score || p.y - q.y);
+  const good = kept.filter(c => c.loaded && (c.visible || c.waitingToFadeIn) && c.inPlace && c.w >= 40)
+                   .sort((p, q) => (q.visible - p.visible) || q.score - p.score || p.y - q.y);
   const rest = kept.filter(c => !good.includes(c)).sort((p, q) => (q.visible - p.visible) || (p.y - q.y));
   // For troubleshooting: every visible graphic near the top of the page, whether or not it counted
-  const topGraphics = good.length ? [] : info.filter(c => c.y < 300 && (c.r.width >= 20 || !vis(c.el))).slice(0, 10)
+  const topGraphics = good.length ? [] : info.filter(c => c.y < 300 && (c.r.width >= 20 || !vis(c.el)))
+    .sort((p, q) => (q.keep - p.keep) || q.score - p.score || (q.r.width - p.r.width)).slice(0, 10)
     .map(c => `${c.isImg ? 'image ' + c.src.split('/').pop() : 'drawn'} | ${cls(c.el).slice(0, 40)} | box: ${cls(c.el.parentElement).slice(0, 50)} | link: ${c.a ? (c.a.getAttribute('href') || '').slice(0, 60) : 'none'} | ${Math.round(c.r.width)}px at x=${Math.round(c.x)}, y=${Math.round(c.y)}${vis(c.el) ? '' : ' (hidden)'}${c.keep ? '' : ' (skipped)'}`);
   return { ok: good.length > 0, candidates: [...good, ...rest].slice(0, 8), topGraphics };
 }"""
@@ -775,11 +779,14 @@ def main() -> int:
     print(json.dumps({"time": now.isoformat(), "up": up, "previous_status": state.get("status"),
                       "views": {f"{t}/{v}": _view_summary(t, results[t].get(v, {})) for t in TARGETS for v in VIEWS},
                       "what_it_found": {v: {
-                          "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}, {c.get('w')}px wide{'' if c.get('visible') else ' (hidden)'}"
+                          "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}, {c.get('w')}px wide"
+                                   f"{'' if c.get('visible') else (' (waiting for its fade-in; counts as OK)' if c.get('waitingToFadeIn') else ' (hidden)')}"
                                    for c in results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("candidates", [])[:3]],
                           "top_of_page_graphics": results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("topGraphics", []),
                           "headline": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("heading", {}).get("matches", [])[:2]],
                           "footer": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("footer", {}).get("matches", [])[:2]],
+                          "page_problems": (results["home"].get(v, {}).get("console_errors", [])[:3]
+                                            + [r for r in results["home"].get(v, {}).get("failed_requests", []) if ".js" in r.lower()][:3]),
                       } for v in VIEWS}},
                      indent=2, ensure_ascii=False, default=str))
 
