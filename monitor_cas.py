@@ -97,22 +97,40 @@ VIS_JS = """const vis = el => { const r = el.getBoundingClientRect(); return r.w
 LOGO_JS = "([hint, mobile]) => {" + VIS_JS + r"""
   window.scrollTo(0, 0);
   const vw = window.innerWidth, re = new RegExp(hint, 'i');
-  const cls = el => typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
+  const cls = el => !el ? '' : typeof el.className === 'string' ? el.className : (el.className && el.className.baseVal) || '';
   const attrs = el => el ? [el.getAttribute('src'), el.currentSrc, el.getAttribute('alt'), el.getAttribute('aria-label'),
                             el.getAttribute('title'), el.id, cls(el)].join(' ') : '';
-  const context = el => { const a = el.closest('a'); return [attrs(el), attrs(el.parentElement), attrs(a), a ? a.getAttribute('href') : ''].join(' '); };
-  const cands = [...document.querySelectorAll('img, svg')]
+  // Logos almost always link to the homepage. Other links aren't evidence: every link contains the site's address.
+  const isHomeLink = a => { if (!a) return false;
+    try { const u = new URL(a.getAttribute('href') || '', location.href); return (u.pathname === '/' || u.pathname === '') && !u.hash; }
+    catch (e) { return false; } };
+  // Small interface icons (menu arrows/carets, hamburger, search, close) are never the logo
+  const iconLike = el => /(^|[\s_-])(icon|caret|arrow|chevron|fa[srb]?|e-font-icon|hamburger|toggle|close|search)([\s_-]|$)/i
+                           .test(cls(el) + ' ' + cls(el.parentElement));
+  const inMenuItem = el => !!el.closest('li, [role=menuitem], .menu-item, .e-n-menu-item, .sub-menu, .dropdown');
+  const all = [...document.querySelectorAll('img, svg')]
     .filter(el => el.tagName.toLowerCase() !== 'svg' || !el.parentElement.closest('svg'))
-    .filter(el => re.test(context(el)));
-  return cands.map(el => {
+    .filter(el => !iconLike(el))
+    .map(el => {
+      const a = el.closest('a');
+      const ownMatch = re.test(attrs(el)), ctxMatch = re.test(attrs(el.parentElement) + ' ' + attrs(a)), home = isHomeLink(a);
+      return { el, ownMatch, ok: ownMatch || ((ctxMatch || home) && !inMenuItem(el)) };
+    })
+    .filter(c => c.ok).map(c => c.el);
+  const info = all.map(el => {
     const r = el.getBoundingClientRect(), x = r.left + scrollX, y = r.top + scrollY;
     const isImg = el.tagName.toLowerCase() === 'img';
     const src = isImg ? (el.currentSrc || el.src || '') : '';
     const loaded = !isImg || (el.complete && (el.naturalWidth > 0 || (/\.svg(\?|$)/i.test(src) && r.width > 0)));
-    return { kind: isImg ? 'image' : 'drawn (svg)', url: src, file: isImg ? src.split('/').pop().slice(0, 80) : (el.getAttribute('aria-label') || cls(el) || (el.closest('a') && (el.closest('a').getAttribute('aria-label') || cls(el.closest('a')))) || 'logo').slice(0, 60),
-             isHeaderLogoFile: true, loaded, visible: vis(el), x: Math.round(x), y: Math.round(y),
+    const a = el.closest('a');
+    return { kind: isImg ? 'image' : 'drawn (svg)', url: src,
+             file: (isImg ? src.split('/').pop() : (el.getAttribute('aria-label') || cls(el) || (a && (a.getAttribute('aria-label') || cls(a))) || 'logo')).slice(0, 70),
+             isHeaderLogoFile: true, loaded, visible: vis(el), x: Math.round(x), y: Math.round(y), w: Math.round(r.width),
              inPlace: y < 250 && (mobile || x < vw * 0.4) };
-  }).sort((p, q) => p.y - q.y).slice(0, 8);
+  });
+  const good = info.filter(c => c.loaded && c.visible && c.inPlace && c.w >= 40);
+  const rest = info.filter(c => !good.includes(c)).sort((p, q) => (q.visible - p.visible) || (p.y - q.y));
+  return { ok: good.length > 0, candidates: [...good, ...rest].slice(0, 8) };
 }"""
 
 CHROME_SELECTOR = ("header, nav, [role=navigation], [role=banner], [data-elementor-type=header], "
@@ -260,9 +278,8 @@ def check_page(pw, browser, target: str, view: str) -> dict:
         res["loaded"] = True
 
         if target == "home":
-            logos = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
-            res["checks"]["logo"] = {"ok": any(l["loaded"] and l["visible"] and l["inPlace"] for l in logos),
-                                     "candidates": logos}
+            logo = page.evaluate(LOGO_JS, [LOGO_HINT, view == "mobile"])
+            res["checks"]["logo"] = {"ok": logo["ok"], "candidates": logo["candidates"]}
             _scroll_through(page)
             try:  # bring the heading into view in case it has an entrance animation
                 page.get_by_text(re.compile(HEADING_HINT, re.I)).last.scroll_into_view_if_needed(timeout=3000)
@@ -718,7 +735,7 @@ def main() -> int:
     print(json.dumps({"time": now.isoformat(), "up": up, "previous_status": state.get("status"),
                       "views": {f"{t}/{v}": _view_summary(t, results[t].get(v, {})) for t in TARGETS for v in VIEWS},
                       "what_it_found": {v: {
-                          "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}"
+                          "logo": [f"{c.get('kind')}: {c.get('file')} at x={c.get('x')}, y={c.get('y')}, {c.get('w')}px wide{'' if c.get('visible') else ' (hidden)'}"
                                    for c in results["home"].get(v, {}).get("checks", {}).get("logo", {}).get("candidates", [])[:3]],
                           "headline": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("heading", {}).get("matches", [])[:2]],
                           "footer": [m.get("text") for m in results["home"].get(v, {}).get("checks", {}).get("footer", {}).get("matches", [])[:2]],
