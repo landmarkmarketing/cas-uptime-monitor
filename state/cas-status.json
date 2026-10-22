@@ -1,1 +1,6 @@
-{"status": "up"}
+{
+  "status": "down",
+  "since": "2026-10-22T11:40:50.281937-05:00",
+  "headline": "The site is up, but part of the homepage is broken: \"Logo\" is not displaying on desktop or mobile.",
+  "last_alert": "2026-10-22T11:40:50.281937-05:00"
+}
