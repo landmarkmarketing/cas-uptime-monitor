@@ -1,6 +1,6 @@
 {
   "status": "down",
   "since": "2026-10-23T05:14:33.267758-05:00",
-  "headline": "The server is returning an error page (HTTP 503).",
+  "headline": "The server accepted the connection but didn't respond within 45 seconds. It's likely overloaded or hung.",
   "last_alert": "2026-10-23T05:14:33.267758-05:00"
 }
